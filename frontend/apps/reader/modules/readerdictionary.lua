@@ -756,78 +756,94 @@ function ReaderDictionary:rawSdcv(words, dict_names, fuzzy_search, lookup_progre
             break -- don't do any more lookup on additional dict_dirs
         end
 
-        local args = {"./sdcv", "--utf8-input", "--utf8-output", "--json-output", "--non-interactive", "--data-dir", dict_dir}
-        if not fuzzy_search then
-            table.insert(args, "--exact-search")
-        end
-        if dict_names then
-            for _, opt in pairs(dict_names) do
-                table.insert(args, "-u")
-                table.insert(args, opt)
+        local data_dirs = {}
+        for _, ifo in pairs(available_ifos) do
+            for _, dict_name in pairs(dict_names) do
+                if ifo.name == dict_name then
+                    table.insert(data_dirs, ifo.file:match("^(.*)[/\\]"))
+                end
+
+                break
             end
         end
-        table.insert(args, "--") -- prevent words starting with a "-" to be interpreted as a sdcv option
-        util.arrayAppend(args, words)
 
-        local cmd = util.shell_escape(args)
-        -- cmd = "sleep 7 ; " .. cmd     -- uncomment to simulate long lookup time
+        if #data_dirs == 0 then
+            table.insert(data_dirs, dict_dir)
+        end
 
-        -- Some sdcv lookups, when using fuzzy search with many dictionaries
-        -- and a really bad selected text, can take up to 10 seconds.
-        -- It is nice to be able to cancel it when noticing wrong text was
-        -- selected.
-        -- Because sdcv starts outputing its output only at the end when it has
-        -- done its work, we can use Trapper:dismissablePopen() to cancel it as
-        -- long as we are waiting for output.
-        -- When fuzzy search is enabled, we have a lookup_progress_msg that can
-        -- be used to catch a tap and trigger cancellation.
-        -- When fuzzy search is disabled, we provide false instead so an
-        -- invisible non-event-forwarding TrapWidget is used to catch a tap
-        -- and trigger cancellation (invisible so there's no need for repaint
-        -- and refresh with the usually fast non-fuzzy search lookups).
-        -- We must ensure we will have some output to be readable (if no
-        -- definition found, sdcv will output some message on stderr, and
-        -- let stdout empty) by appending an "echo":
-        cmd = cmd .. "; echo"
-        -- NOTE: Bionic doesn't support rpath, but does honor LD_LIBRARY_PATH...
-        --       Give it a shove so it can actually find the STL.
+        local full_cmd = ""
+
+        for _, data_dir in pairs(data_dirs) do
+            local args = {"./sdcv", "--utf8-input", "--utf8-output", "--json-output", "--non-interactive", "--data-dir", data_dir}
+            if not fuzzy_search then
+                table.insert(args, "--exact-search")
+            end
+
+            if dict_names then
+                for _, opt in pairs(dict_names) do
+                    table.insert(args, "-u")
+                    table.insert(args, opt)
+                end
+            end
+
+            table.insert(args, "--") -- prevent words starting with a "-" to be interpreted as a sdcv option
+            util.arrayAppend(args, words)
+
+            local cmd = util.shell_escape(args)
+
+            if full_cmd == "" then
+                full_cmd = cmd
+            else
+                full_cmd = full_cmd .. " && " .. cmd
+            end
+        end
+
+        full_cmd = full_cmd .. "; echo"
+
         if Device:isAndroid() then
             C.setenv("LD_LIBRARY_PATH", "./libs", 1)
         end
-        local completed, results_str = Trapper:dismissablePopen(cmd, lookup_progress_msg)
+        local completed, results_lines= Trapper:dismissablePopen(full_cmd, lookup_progress_msg)
         if Device:isAndroid() then
             -- NOTE: It's unset by default, so this is perfectly fine.
             C.unsetenv("LD_LIBRARY_PATH")
         end
         lookup_cancelled = not completed
-        if results_str and results_str ~= "\n" then -- \n is when lookup was cancelled
-            -- sdcv can return multiple results if we passed multiple words to
-            -- the cmdline. In this case, the lookup results for each word are
-            -- newline separated. The JSON output doesn't contain raw newlines
-            -- so it's safe to split. Ideally luajson would support jsonl but
-            -- unfortunately it doesn't and it also seems to decode the last
-            -- object rather than the first one if there are multiple.
-            local result_word_idx = 0
-            for _, entry_str in ipairs(util.splitToArray(results_str, "\n")) do
-                result_word_idx = result_word_idx + 1
-                local ok, results = pcall(JSON.decode, entry_str)
-                if not ok or not results then
-                    logger.warn("JSON data cannot be decoded", results)
-                    -- Need to insert an empty table so that the word entries
-                    -- match up to the result entries (so that callers can
-                    -- batch lookups to reduce the cost of bulk lookups while
-                    -- still being able to figure out which lookup came from
-                    -- which word).
-                    results = {}
+
+        if results_lines == nil then
+            break
+        end
+
+        for results_str in results_lines:gmatch("[^\r\n]+") do
+            if results_str and results_str ~= "\n" then -- \n is when lookup was cancelled
+                -- sdcv can return multiple results if we passed multiple words to
+                -- the cmdline. In this case, the lookup results for each word are
+                -- newline separated. The JSON output doesn't contain raw newlines
+                -- so it's safe to split. Ideally luajson would support jsonl but
+                -- unfortunately it doesn't and it also seems to decode the last
+                -- object rather than the first one if there are multiple.
+                local result_word_idx = 0
+                for _, entry_str in ipairs(util.splitToArray(results_str, "\n")) do
+                    result_word_idx = result_word_idx + 1
+                    local ok, results = pcall(JSON.decode, entry_str)
+                    if not ok or not results then
+                        logger.warn("JSON data cannot be decoded", results)
+                        -- Need to insert an empty table so that the word entries
+                        -- match up to the result entries (so that callers can
+                        -- batch lookups to reduce the cost of bulk lookups while
+                        -- still being able to figure out which lookup came from
+                        -- which word).
+                        results = {}
+                    end
+                    if all_results[result_word_idx] then
+                        util.arrayAppend(all_results[result_word_idx], results)
+                    else
+                        table.insert(all_results, results)
+                    end
                 end
-                if all_results[result_word_idx] then
-                    util.arrayAppend(all_results[result_word_idx], results)
-                else
-                    table.insert(all_results, results)
+                if result_word_idx ~= #words then
+                    logger.warn("sdcv returned a different number of results than the number of words")
                 end
-            end
-            if result_word_idx ~= #words then
-                logger.warn("sdcv returned a different number of results than the number of words")
             end
         end
     end
